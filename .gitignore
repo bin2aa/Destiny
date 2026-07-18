@@ -1,0 +1,22 @@
+# Environment variables (contains secrets)
+.env
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Go backend - build artifacts
+backend/bin/
+backend/tmp/
+backend/vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Node (dự phòng, mobile đã có .gitignore riêng)
+node_modules/

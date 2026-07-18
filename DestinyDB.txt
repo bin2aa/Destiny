@@ -1,0 +1,416 @@
+-- ============================================================================
+-- SCHEMA APP ĐOÁN MỆNH - v2 (đã tái cấu trúc)
+-- Thay đổi chính so với bản gốc:
+--   - Gộp bazi_chart, birth_element_scores, numerology, mbti_prediction,
+--     big_five -> analysis_results (JSONB, linh hoạt thêm loại phân tích mới)
+--   - Gộp report_history vào ai_reports (thêm status, generated_by)
+--   - Gộp generated_embeddings vào knowledge_base
+--   - Thêm bảng plans (tách khỏi subscriptions.plan dạng string)
+--   - Thêm bảng report_types (lookup thay vì ENUM, vì domain hay mở rộng)
+--   - Sửa naming FK: planet_a/b -> planet_a_id/b_id, profile_a/b -> profile_a_id/b_id
+--   - Thêm unique constraint chống trùng lặp (daily_horoscope, compatibility)
+--   - Thêm timestamps còn thiếu (payments, notifications, các bảng có thể update)
+--   - lat/long dùng NUMERIC thay vì FLOAT để tránh sai số tính toán chiêm tinh
+-- Tổng số bảng: 30 -> 26 (giảm 4, trong đó 5 bảng phân tích gộp thành 1)
+-- ============================================================================
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto; -- cho gen_random_uuid()
+
+-- ============================================================================
+-- ENUM TYPES
+-- Dùng ENUM cho các domain rất ít khi thay đổi (biết trước gần như đầy đủ
+-- giá trị ngay từ đầu). Ngược lại, domain hay mở rộng thì dùng bảng lookup
+-- (xem report_types bên dưới) để tránh phải ALTER TYPE.
+-- ============================================================================
+
+CREATE TYPE subscription_status AS ENUM ('active', 'expired', 'cancelled', 'pending');
+CREATE TYPE payment_status AS ENUM ('pending', 'success', 'failed', 'refunded');
+CREATE TYPE analysis_type AS ENUM ('bazi', 'numerology', 'mbti', 'big_five', 'element_scores');
+CREATE TYPE report_status AS ENUM ('pending', 'success', 'failed');
+
+-- ============================================================================
+-- 1. USERS & AUTH
+-- ============================================================================
+
+CREATE TABLE users (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name            VARCHAR(150) NOT NULL,
+    email           VARCHAR(255) NOT NULL UNIQUE,
+    password_hash   VARCHAR(255) NOT NULL,           -- đổi tên từ "password"
+    avatar          VARCHAR(500),
+    language        VARCHAR(10) DEFAULT 'vi',
+    timezone        VARCHAR(50) DEFAULT 'Asia/Ho_Chi_Minh',
+    country         VARCHAR(2),                      -- ISO 3166-1 alpha-2
+    premium_until   TIMESTAMPTZ,                      -- cache, xem ghi chú bên dưới
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Ghi chú: premium_until là bản cache được đồng bộ mỗi khi subscriptions
+-- thay đổi (qua trigger hoặc application code khi confirm payment thành
+-- công). Mục đích: check quyền truy cập premium không cần JOIN bảng
+-- subscriptions ở mọi request. Nếu app của bạn chưa có traffic lớn,
+-- cân nhắc bỏ cột này và JOIN trực tiếp cho đơn giản, tránh rủi ro
+-- lệch dữ liệu giữa 2 nguồn.
+
+-- ============================================================================
+-- 2. BILLING (plans tách riêng khỏi subscriptions)
+-- ============================================================================
+
+CREATE TABLE plans (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    code            VARCHAR(50) NOT NULL UNIQUE,      -- 'premium_monthly'
+    name            VARCHAR(100) NOT NULL,
+    price           NUMERIC(12,2) NOT NULL,
+    currency        VARCHAR(3) NOT NULL DEFAULT 'VND',
+    duration_days   INT NOT NULL,
+    features        JSONB,                            -- danh sách tính năng đi kèm
+    is_active       BOOLEAN NOT NULL DEFAULT true,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE subscriptions (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    plan_id         UUID NOT NULL REFERENCES plans(id),
+    start_at        TIMESTAMPTZ NOT NULL,
+    end_at          TIMESTAMPTZ NOT NULL,
+    status          subscription_status NOT NULL DEFAULT 'pending',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_subscriptions_user ON subscriptions(user_id);
+
+CREATE TABLE payments (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    subscription_id UUID NOT NULL REFERENCES subscriptions(id),
+    provider        VARCHAR(50) NOT NULL,             -- 'momo', 'vnpay', 'stripe'...
+    amount          NUMERIC(12,2) NOT NULL,
+    currency        VARCHAR(3) NOT NULL DEFAULT 'VND',
+    status          payment_status NOT NULL DEFAULT 'pending',
+    transaction_id  VARCHAR(255),                      -- mã giao dịch từ cổng thanh toán
+    paid_at         TIMESTAMPTZ,                        -- thời điểm thanh toán thành công (nullable)
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(), -- thời điểm tạo giao dịch (bắt buộc)
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_payments_subscription ON payments(subscription_id);
+CREATE INDEX idx_payments_transaction ON payments(transaction_id);
+
+-- ============================================================================
+-- 3. BIRTH PROFILE
+-- ============================================================================
+
+CREATE TABLE birth_profiles (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    full_name       VARCHAR(150) NOT NULL,
+    gender          VARCHAR(20),
+    birth_date      DATE NOT NULL,
+    birth_time      TIME,                              -- nullable nếu is_unknown_time
+    timezone        VARCHAR(50) NOT NULL,
+    latitude        NUMERIC(9,6),                       -- NUMERIC thay vì FLOAT: tránh sai số
+    longitude       NUMERIC(9,6),                        -- ảnh hưởng tính toán chiêm tinh
+    city            VARCHAR(150),
+    country         VARCHAR(2),
+    birth_place     VARCHAR(255),
+    is_unknown_time BOOLEAN NOT NULL DEFAULT false,
+    note            TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_birth_profiles_user ON birth_profiles(user_id);
+
+-- ============================================================================
+-- 4. LOOKUP TABLES (dữ liệu tĩnh, đa ngôn ngữ hoá ở tầng content nếu cần)
+-- ============================================================================
+
+CREATE TABLE zodiac_signs (
+    id          SMALLSERIAL PRIMARY KEY,
+    name        VARCHAR(50) NOT NULL,
+    element     VARCHAR(20),
+    modality    VARCHAR(20),
+    symbol      VARCHAR(10),
+    description TEXT
+);
+
+CREATE TABLE planets (
+    id          SMALLSERIAL PRIMARY KEY,
+    name        VARCHAR(50) NOT NULL,
+    symbol      VARCHAR(10),
+    description TEXT
+);
+
+CREATE TABLE houses (
+    id          SMALLSERIAL PRIMARY KEY,
+    number      SMALLINT NOT NULL,
+    name        VARCHAR(100),
+    description TEXT
+);
+
+CREATE TABLE aspects (
+    id     SMALLSERIAL PRIMARY KEY,
+    name   VARCHAR(50) NOT NULL,
+    angle  NUMERIC(5,2) NOT NULL,
+    orb    NUMERIC(5,2) NOT NULL
+);
+
+CREATE TABLE chinese_zodiac (
+    id          SMALLSERIAL PRIMARY KEY,
+    animal      VARCHAR(50) NOT NULL,
+    yin_yang    VARCHAR(10),
+    element     VARCHAR(20),
+    description TEXT
+);
+
+CREATE TABLE five_elements (
+    id          SMALLSERIAL PRIMARY KEY,
+    name        VARCHAR(50) NOT NULL,
+    description TEXT
+    -- Bảng này chỉ phục vụ tra cứu mô tả cho UI (Kim/Mộc/Thuỷ/Hoả/Thổ),
+    -- không có FK trỏ tới vì điểm số ngũ hành nằm trong analysis_results
+    -- (analysis_type = 'element_scores').
+);
+
+-- ============================================================================
+-- 5. TÂY PHƯƠNG CHIÊM TINH (dữ liệu tính toán 1-nhiều theo profile)
+-- ============================================================================
+
+CREATE TABLE planet_positions (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    birth_profile_id UUID NOT NULL REFERENCES birth_profiles(id) ON DELETE CASCADE,
+    planet_id       SMALLINT NOT NULL REFERENCES planets(id),
+    sign_id         SMALLINT NOT NULL REFERENCES zodiac_signs(id),
+    house           SMALLINT REFERENCES houses(id),
+    degree          SMALLINT NOT NULL CHECK (degree BETWEEN 0 AND 29),
+    minute          SMALLINT NOT NULL CHECK (minute BETWEEN 0 AND 59),
+    retrograde      BOOLEAN NOT NULL DEFAULT false,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_planet_positions_profile ON planet_positions(birth_profile_id);
+
+CREATE TABLE natal_aspects (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    birth_profile_id UUID NOT NULL REFERENCES birth_profiles(id) ON DELETE CASCADE,
+    planet_a_id      SMALLINT NOT NULL REFERENCES planets(id),  -- đổi tên: thêm hậu tố _id
+    planet_b_id      SMALLINT NOT NULL REFERENCES planets(id),
+    aspect_id        SMALLINT NOT NULL REFERENCES aspects(id),
+    orb              NUMERIC(5,2) NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_natal_aspects_profile ON natal_aspects(birth_profile_id);
+
+-- ============================================================================
+-- 6. ANALYSIS RESULTS (gộp bazi_chart, birth_element_scores, numerology,
+--    mbti_prediction, big_five -> 1 bảng JSONB linh hoạt)
+-- ============================================================================
+
+CREATE TABLE analysis_results (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    birth_profile_id UUID NOT NULL REFERENCES birth_profiles(id) ON DELETE CASCADE,
+    analysis_type    analysis_type NOT NULL,
+    data             JSONB NOT NULL,
+    -- Ví dụ data theo từng analysis_type:
+    --   'bazi': {"year_stem":"Giáp","year_branch":"Tý","month_stem":"Bính",
+    --            "month_branch":"Dần","day_stem":"Mậu","day_branch":"Thìn",
+    --            "hour_stem":"Canh","hour_branch":"Ngọ","day_master":"Mậu Thổ",
+    --            "favorable_element":"Hoả","unfavorable_element":"Thuỷ"}
+    --   'element_scores': {"wood":15,"fire":30,"earth":20,"metal":10,"water":25}
+    --   'numerology': {"life_path":7,"expression":3,"soul":9,
+    --                  "personality":5,"birthday":2,"maturity":8}
+    --   'mbti': {"type":"INFJ","confidence":0.82}
+    --   'big_five': {"openness":72,"conscientiousness":65,"extroversion":40,
+    --                "agreeableness":58,"neuroticism":35}
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (birth_profile_id, analysis_type) -- mỗi profile chỉ có 1 kết quả/loại
+);
+
+CREATE INDEX idx_analysis_results_profile ON analysis_results(birth_profile_id);
+CREATE INDEX idx_analysis_results_data ON analysis_results USING GIN (data);
+
+-- ============================================================================
+-- 7. TAROT (append-only, 1 profile có thể có nhiều lượt bói)
+-- ============================================================================
+
+CREATE TABLE tarot_readings (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    birth_profile_id UUID NOT NULL REFERENCES birth_profiles(id) ON DELETE CASCADE,
+    question         TEXT,
+    spread           VARCHAR(50),              -- 'three_card', 'celtic_cross'...
+    result           JSONB NOT NULL,            -- danh sách lá bài + vị trí
+    ai_summary       TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_tarot_readings_profile ON tarot_readings(birth_profile_id);
+
+-- ============================================================================
+-- 8. AI CHAT & REPORTS
+-- ============================================================================
+
+CREATE TABLE ai_chat (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id          UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    birth_profile_id UUID REFERENCES birth_profiles(id) ON DELETE SET NULL,
+    title            VARCHAR(255),
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now() -- title có thể đổi sau
+);
+
+CREATE INDEX idx_ai_chat_user ON ai_chat(user_id);
+
+CREATE TABLE ai_messages (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    chat_id    UUID NOT NULL REFERENCES ai_chat(id) ON DELETE CASCADE,
+    role       VARCHAR(20) NOT NULL CHECK (role IN ('user','assistant','system')),
+    content    TEXT NOT NULL,
+    token      INT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_ai_messages_chat ON ai_messages(chat_id);
+
+-- report_types: bảng lookup (không dùng ENUM) vì đây là domain cốt lõi
+-- của app, dự kiến sẽ thêm trường phái luận giải mới thường xuyên.
+CREATE TABLE report_types (
+    code        VARCHAR(50) PRIMARY KEY,   -- 'western_natal', 'bazi', 'compatibility'...
+    name        VARCHAR(150) NOT NULL,
+    description TEXT,
+    is_active   BOOLEAN NOT NULL DEFAULT true
+);
+
+-- ai_reports: gộp report_history vào đây (thêm status, generated_by).
+-- Trước đây 2 bảng này chồng chéo chức năng audit + nội dung report.
+CREATE TABLE ai_reports (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    birth_profile_id UUID NOT NULL REFERENCES birth_profiles(id) ON DELETE CASCADE,
+    report_type      VARCHAR(50) NOT NULL REFERENCES report_types(code),
+    prompt_version   VARCHAR(20),
+    model            VARCHAR(50),               -- 'claude-sonnet-5', 'gpt-4o'...
+    content           TEXT,                       -- NULL nếu status = 'failed'
+    language          VARCHAR(10) DEFAULT 'vi',
+    status            report_status NOT NULL DEFAULT 'pending',
+    generated_by      VARCHAR(50),                -- 'cron', 'user_request', 'admin'
+    version           INT NOT NULL DEFAULT 1,     -- tăng dần nếu report cùng loại được sinh lại
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_ai_reports_profile ON ai_reports(birth_profile_id);
+CREATE INDEX idx_ai_reports_type ON ai_reports(report_type);
+
+-- ============================================================================
+-- 9. KNOWLEDGE BASE (RAG) - gộp generated_embeddings vào đây
+-- ============================================================================
+
+CREATE TABLE knowledge_base (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    category          VARCHAR(100),
+    title             VARCHAR(255) NOT NULL,
+    content           TEXT NOT NULL,
+    embedding         VECTOR(1536),          -- cần extension pgvector
+    embedding_model   VARCHAR(100),           -- model dùng để sinh embedding hiện tại
+    language          VARCHAR(10) DEFAULT 'vi',
+    source            VARCHAR(255),
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Ghi chú: nếu sau này bạn thực sự cần so sánh nhiều embedding model
+-- cùng lúc (ví dụ test model mới trước khi migrate toàn bộ), hãy tách
+-- lại thành bảng con lúc đó — đừng thiết kế trước cho nhu cầu chưa
+-- chắc chắn sẽ xảy ra (YAGNI - You Aren't Gonna Need It).
+
+CREATE TABLE prompt_templates (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name           VARCHAR(100) NOT NULL,
+    system_prompt  TEXT NOT NULL,
+    version        INT NOT NULL DEFAULT 1,
+    active         BOOLEAN NOT NULL DEFAULT true,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============================================================================
+-- 10. DAILY HOROSCOPE (unique constraint chống trùng lặp cron chạy 2 lần)
+-- ============================================================================
+
+CREATE TABLE daily_horoscope (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    birth_profile_id UUID NOT NULL REFERENCES birth_profiles(id) ON DELETE CASCADE,
+    date             DATE NOT NULL,
+    summary          TEXT,
+    career           TEXT,
+    love             TEXT,
+    health           TEXT,
+    finance          TEXT,
+    lucky_color      VARCHAR(50),
+    lucky_number     SMALLINT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (birth_profile_id, date)
+) PARTITION BY RANGE (date);
+-- Partition theo tháng để tránh phình bảng (ước tính vài chục nghìn user
+-- active x 365 ngày = hàng chục triệu dòng/năm). Tạo partition mới mỗi
+-- tháng bằng cron job hoặc pg_partman. Ví dụ partition tháng 7/2026:
+--
+-- CREATE TABLE daily_horoscope_2026_07 PARTITION OF daily_horoscope
+--     FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
+--
+-- Kèm theo job định kỳ DROP partition cũ hơn N tháng nếu không cần lưu
+-- lâu dài (vận trình ngày cũ hiếm khi được xem lại).
+
+-- ============================================================================
+-- 11. COMPATIBILITY (hợp mệnh giữa 2 profile)
+-- ============================================================================
+
+CREATE TABLE compatibility (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    profile_a_id     UUID NOT NULL REFERENCES birth_profiles(id) ON DELETE CASCADE,
+    profile_b_id     UUID NOT NULL REFERENCES birth_profiles(id) ON DELETE CASCADE,
+    love_score       SMALLINT CHECK (love_score BETWEEN 0 AND 100),
+    friend_score     SMALLINT CHECK (friend_score BETWEEN 0 AND 100),
+    marriage_score   SMALLINT CHECK (marriage_score BETWEEN 0 AND 100),
+    business_score   SMALLINT CHECK (business_score BETWEEN 0 AND 100),
+    summary          TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (profile_a_id < profile_b_id),           -- ép thứ tự, tránh trùng A-B/B-A
+    UNIQUE (profile_a_id, profile_b_id)
+);
+
+-- ============================================================================
+-- 12. GAMIFICATION & NOTIFICATIONS
+-- ============================================================================
+
+CREATE TABLE achievements (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title       VARCHAR(150) NOT NULL,
+    description TEXT,
+    icon        VARCHAR(255)
+);
+
+CREATE TABLE user_achievements (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id        UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    achievement_id UUID NOT NULL REFERENCES achievements(id) ON DELETE CASCADE,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, achievement_id) -- không unlock trùng 1 thành tựu nhiều lần
+);
+
+CREATE TABLE notifications (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title      VARCHAR(255) NOT NULL,
+    body       TEXT,
+    type       VARCHAR(50),           -- varchar, không enum: loại thông báo
+                                        -- thường do team marketing/product
+                                        -- thêm liên tục, ENUM sẽ gây phiền
+    read_at    TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now() -- thiếu ở bản gốc, đã bổ sung
+);
+
+CREATE INDEX idx_notifications_user_unread
+    ON notifications(user_id) WHERE read_at IS NULL;
